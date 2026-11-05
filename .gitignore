@@ -1,0 +1,11 @@
+.venv/
+__pycache__/
+*.pyc
+.DS_Store
+
+# Private client photos stay on this Mac.
+/*.jpg
+/*.jpeg
+/*.JPG
+/*.JPEG
+*_original

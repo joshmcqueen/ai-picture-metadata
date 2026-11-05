@@ -1,0 +1,54 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="photo-token" content="{{ token }}">
+  <title>Photo Metadata Inspector</title>
+  <link rel="icon" href="{{ url_for('static', filename='favicon.svg') }}" type="image/svg+xml">
+  <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+  <script src="{{ url_for('static', filename='app.js') }}" defer></script>
+</head>
+<body>
+  <header class="topbar">
+    <a class="brand" href="/" aria-label="Photo Metadata Inspector home"><span class="brand-icon" aria-hidden="true">◈</span> PHOTO METADATA <span class="brand-light">/ INSPECTOR</span></a>
+    <span class="local-badge"><span></span> LOCAL & PRIVATE</span>
+  </header>
+  <main>
+    <section class="intro">
+      <p class="eyebrow">A CLOSER LOOK AT YOUR PHOTOS</p>
+      <h1>Your photograph.<br><em>The story in its metadata.</em></h1>
+      <p class="intro-copy">See what your editing tools leave behind. Inspect AI-related metadata and create verified cleaned copies, without changing the image.</p>
+    </section>
+    <section class="workspace" aria-label="Photo inspection workspace">
+      <div id="dropzone" class="dropzone" role="region" aria-label="Drop JPEG photos here">
+        <div class="drop-icon" aria-hidden="true">↥</div>
+        <h2>Bring your photos into focus</h2>
+        <p>Drop JPEGs here, or choose files from your Mac.</p>
+        <div class="import-buttons">
+          <button id="choose" class="primary">Choose photos <span aria-hidden="true">↗</span></button>
+          <button id="samples" class="secondary">Inspect photos in this folder</button>
+        </div>
+        <input id="files" type="file" accept=".jpg,.jpeg,image/jpeg" multiple hidden>
+        <p class="fine">JPG / JPEG · Up to 64 MB each · Originals always preserved</p>
+      </div>
+      <div class="privacy-note"><span aria-hidden="true">⌁</span> Everything happens on this Mac. No cloud, accounts, or photo uploads to external services.</div>
+      <p id="activity" class="activity" role="status" aria-live="polite"></p>
+      <div id="errors" role="alert"></div>
+      <section id="results" hidden aria-label="Inspection results">
+        <div class="results-heading"><div><p class="eyebrow">YOUR SESSION</p><h2>Inspection results <span id="count"></span></h2></div><a id="report" class="text-button" href="/api/report" download>Export JSON report ↓</a></div>
+        <div class="summary" id="summary"></div>
+        <div class="batchbar"><label><input id="select-all" type="checkbox"> Select photos with AI evidence</label><div><button id="clean-selected" class="primary compact" disabled>Create cleaned copies</button><button id="zip" class="secondary compact" disabled>Download selected ZIP ↓</button></div></div>
+        <p class="cleanup-note">Cleanup removes the entire AI-related credential, including other provenance inside it, and explicit generative-AI source declarations. Image data, color profiles, and unrelated metadata are checked for preservation.</p>
+        <div id="photos" class="photo-list"></div>
+      </section>
+    </section>
+    <section class="explanation">
+      <div><span class="step">01 / INSPECT</span><h3>Read the record.</h3><p>See the editing app, embedded credentials, and exact declarations that mention generative AI.</p></div>
+      <div><span class="step">02 / UNDERSTAND</span><h3>Editing isn’t generation.</h3><p>A small object removal can leave an AI-editing credential. A credential alone doesn’t establish AI use.</p></div>
+      <div><span class="step">03 / KEEP CONTROL</span><h3>Make a separate copy.</h3><p>Cleanup preserves the compressed image data. Your original is never edited or overwritten.</p></div>
+    </section>
+    <footer><strong>A note on labels</strong><p>This tool reads embedded declarations; it does not verify credential signatures or detect AI from pixels. Missing metadata doesn’t prove a photo was never edited with AI. Removing metadata cannot guarantee how Instagram or Facebook will label it.</p><span>Built for photographs. Kept on your Mac.</span></footer>
+  </main>
+</body>
+</html>
