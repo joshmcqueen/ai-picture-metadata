@@ -1,10 +1,14 @@
-"""Read metadata with ExifTool; clean only copies and verify JPEG preservation."""
+"""Read metadata with ExifTool and verify JPEG preservation before replacing a file."""
+import ctypes
 import hashlib
 import json
 import os
 import re
 import shutil
+import stat
 import subprocess
+import sys
+import tempfile
 from pathlib import Path
 
 
@@ -212,7 +216,7 @@ def clean(source, target, before=None):
         tool(*args, target.resolve())
         after = inspect(target)
         if after['evidence'] or (remove_credential and after['credential_present']):
-            raise InspectionError('AI evidence remains. No cleaned download was created.')
+            raise InspectionError('AI evidence remains after cleanup.')
         cleaned = target.read_bytes()
         if preserved_parts(original, remove_credential, bool(fields)) != preserved_parts(cleaned, remove_credential, bool(fields)):
             raise InspectionError('Preservation check failed: unrelated JPEG bytes changed.')
@@ -231,3 +235,60 @@ def clean(source, target, before=None):
         if created:
             target.unlink(missing_ok=True)
         raise
+
+
+def file_state(info):
+    if not stat.S_ISREG(info.st_mode):
+        raise InspectionError('The source must be a regular JPEG file.')
+    return (info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns, info.st_ctime_ns, info.st_mode, info.st_nlink)
+
+
+def clean_in_place(source, before, expected_state):
+    """Verify an isolated JPEG, then atomically replace the original directory entry."""
+    source = Path(source)
+    changed = 'The source changed after inspection. Choose it again to re-inspect it.'
+    if file_state(source.lstat()) != expected_state:
+        raise InspectionError(changed)
+
+    flags = os.O_RDWR | os.O_NOFOLLOW | os.O_NONBLOCK
+    with os.fdopen(os.open(source, flags), 'rb') as original:
+        info = os.fstat(original.fileno())
+        if file_state(info) != expected_state:
+            raise InspectionError(changed)
+        if info.st_nlink != 1:
+            raise InspectionError('Cleanup requires an original without other hard links.')
+
+        with tempfile.TemporaryDirectory(prefix='.photo-metadata-', dir=source.parent) as workspace:
+            staged = Path(workspace) / 'verified.jpg'
+            outcome = clean(source, staged, before)
+            if outcome is None:
+                return None, expected_state
+
+            with staged.open('r+b') as replacement:
+                if sys.platform == 'darwin':
+                    # COPYFILE_METADATA includes stat information, ACLs, and extended attributes.
+                    copy_metadata = ctypes.CDLL(None, use_errno=True).fcopyfile
+                    copy_metadata.argtypes = [ctypes.c_int, ctypes.c_int, ctypes.c_void_p, ctypes.c_uint32]
+                    if copy_metadata(original.fileno(), replacement.fileno(), None, 0b111) != 0:
+                        error = ctypes.get_errno()
+                        raise OSError(error, os.strerror(error))
+                else:
+                    shutil.copystat(source, staged)
+                copied = os.fstat(replacement.fileno())
+                if (copied.st_uid, copied.st_gid, stat.S_IMODE(copied.st_mode)) != (
+                        info.st_uid, info.st_gid, stat.S_IMODE(info.st_mode)):
+                    raise InspectionError('The original file permissions could not be preserved.')
+                replacement.seek(0)
+                digest = hashlib.sha256()
+                for chunk in iter(lambda: replacement.read(1024 * 1024), b''):
+                    digest.update(chunk)
+                if digest.hexdigest() != outcome['report']['sha256']:
+                    raise InspectionError('The staged JPEG changed while preserving file attributes.')
+                os.fsync(replacement.fileno())
+                if file_state(source.lstat()) != expected_state:
+                    raise InspectionError(changed)
+                os.replace(staged, source)
+                new_state = file_state(os.fstat(replacement.fileno()))
+
+    outcome['verification'] = 'Verified and saved in place. Compressed image data and unrelated metadata were preserved.'
+    return outcome, new_state

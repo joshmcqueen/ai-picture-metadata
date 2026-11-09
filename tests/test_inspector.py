@@ -1,14 +1,18 @@
 import hashlib
 import io
 import json
+import os
 import struct
+import shutil
+import subprocess
+import sys
 import tempfile
 import unittest
-import zipfile
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
-from app import ROOT, create_app
+from app import DISK_RESERVE, MAX_FILE, ROOT, create_app
 from inspector import InspectionError, classify, clean, inspect, preserved_parts, segments, tool
 
 SAMPLES = ['25EE0779-Edit.jpg', '398A7418.jpg', '398A7475.jpg']
@@ -180,43 +184,135 @@ class ApiTests(unittest.TestCase):
     def tearDown(self):
         self.app.extensions['dispose']()
 
-    def upload(self, name, data):
+    def upload(self, name, data, relative_path=None):
+        fields = {'photo': (io.BytesIO(data), name)}
+        if relative_path is not None:
+            fields['relative_path'] = relative_path
         response = self.client.post('/api/photos', headers=self.headers,
-                                    data={'photo': (io.BytesIO(data), name)})
+                                    data=fields)
         response.request.environ['wsgi.input'].close()
         return response
 
-    @requires_samples
-    def test_complete_batch_and_downloads_with_duplicate_names_and_error(self):
-        photo_data = (ROOT / SAMPLES[2]).read_bytes()
-        first = self.upload('same.jpg', photo_data).get_json()
-        second = self.upload('same.jpg', photo_data).get_json()
-        malformed = self.upload('broken.jpg', b'not a jpeg').get_json()
+    def test_folder_paths_are_kept_without_becoming_storage_paths(self):
+        first = self.upload('same.JPG', b'bad jpeg', 'Wedding/Ceremony/same.JPG').get_json()
+        second = self.upload('same.JPG', b'bad jpeg', 'Wedding/Reception/same.JPG').get_json()
         self.assertNotEqual(first['id'], second['id'])
-        self.assertEqual(malformed['report']['status'], 'error')
-        clean_ids = [first['id'], second['id']]
-        response = self.client.post('/api/clean', headers=self.headers,
-                                    json={'ids': clean_ids + [malformed['id'], 'missing']})
-        self.assertEqual(response.status_code, 200)
-        self.assertEqual([r['status'] for r in response.get_json()['results']],
-                         ['cleaned', 'cleaned', 'error', 'error'])
-        individual = self.client.get('/api/photos/' + first['id'] + '/download')
-        self.assertEqual(individual.status_code, 200)
-        cleaned_data = individual.data
-        self.assertEqual(cleaned_data, photo_data[:2] + photo_data[14450:])
-        individual.close()
-        response = self.client.post('/api/download.zip', headers=self.headers, json={'ids': clean_ids})
-        self.assertEqual(response.status_code, 200)
-        with zipfile.ZipFile(io.BytesIO(response.data)) as archive:
-            self.assertEqual(archive.namelist(), ['same-cleaned.jpg', 'same-cleaned-2.jpg'])
-            self.assertEqual(archive.read('same-cleaned.jpg'), cleaned_data)
-        response.close()
-        report = self.client.get('/api/report')
-        body = json.loads(report.data)
-        self.assertEqual(len(body['photos']), 3)
-        self.assertNotIn('path', body['photos'][0])
-        self.assertNotIn(str(self.app.extensions['photo_temp']), report.data.decode())
-        report.close()
+        self.assertEqual(first['name'], second['name'])
+        self.assertEqual(first['relative_path'], 'Wedding/Ceremony/same.JPG')
+        self.assertEqual(second['relative_path'], 'Wedding/Reception/same.JPG')
+        self.assertEqual(self.upload('same.JPG', b'bad jpeg', '../same.JPG').status_code, 422)
+        self.assertEqual(len(list(self.app.extensions['photo_temp'].iterdir())), 2)
+        with self.client.get('/api/report') as response:
+            self.assertEqual(json.loads(response.data)['photos'], [first, second])
+
+    def test_configured_folder_recurses_and_continues_past_bad_files(self):
+        with tempfile.TemporaryDirectory() as input_dir:
+            root = Path(input_dir)
+            (root / 'Ceremony').mkdir()
+            (root / 'Reception' / 'Dancing').mkdir(parents=True)
+            for name in ('Ceremony/same.JPG', 'Reception/Dancing/same.jpeg', 'skip.png', '._extra.jpg'):
+                (root / name).write_bytes(b'not a jpeg')
+            (root / 'link').symlink_to(root, target_is_directory=True)
+            with (root / 'Ceremony' / 'oversize.jpg').open('wb') as f:
+                f.truncate(MAX_FILE + 1)
+            app = create_app(root)
+            self.addCleanup(app.extensions['dispose'])
+            response = app.test_client().post('/api/samples',
+                                              headers={'X-Photo-Token': app.extensions['photo_token']})
+        result = response.get_json()
+        self.assertEqual([p['relative_path'] for p in result['photos']],
+                         ['Ceremony/same.JPG', 'Reception/Dancing/same.jpeg'])
+        self.assertEqual(result['errors'][0]['name'], 'Ceremony/oversize.jpg')
+
+    def test_disk_space_replaces_fixed_session_quota(self):
+        folder = self.app.extensions['photo_temp']
+        with (folder / 'existing-copy.jpg').open('wb') as f:
+            f.truncate(2 * 1024 ** 3)
+        with patch('app.shutil.disk_usage', return_value=SimpleNamespace(free=8 * 1024 ** 3)):
+            first = self.upload('photo.jpg', b'bad jpeg')
+        self.assertEqual(first.status_code, 201)
+        previous = set(folder.iterdir())
+        with patch('app.shutil.disk_usage', return_value=SimpleNamespace(free=DISK_RESERVE)):
+            full = self.upload('next.jpg', b'bad jpeg')
+        self.assertEqual(full.status_code, 507)
+        self.assertIn('disk space', full.get_json()['error'])
+        self.assertEqual(set(folder.iterdir()), previous)
+
+    @requires_samples
+    def test_cleaning_updates_only_selected_originals(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            first = root / 'Wedding' / 'Ceremony' / 'same.jpg'
+            second = root / 'Wedding' / 'Reception' / 'same.jpg'
+            malformed = root / 'Wedding' / 'bad.jpg'
+            photo_data = (ROOT / SAMPLES[2]).read_bytes()
+            for path in (first, second):
+                path.parent.mkdir(parents=True)
+                path.write_bytes(photo_data)
+                path.chmod(0o640)
+            os.utime(first, (1_700_000_000, 1_700_000_000))
+            if sys.platform == 'darwin':
+                subprocess.run(['/usr/bin/xattr', '-w', 'com.example.photo-test', 'wedding', str(first)], check=True)
+            malformed.write_bytes(b'not a jpeg')
+            with patch('app.choose_originals', return_value=[root / 'Wedding']) as chooser:
+                response = self.client.post('/api/choose', headers=self.headers, json={'kind': 'folders'})
+            chooser.assert_called_once_with('folders')
+            self.assertEqual(response.status_code, 200)
+            photos = {p['relative_path']: p for p in response.get_json()['photos']}
+            selected = photos['Wedding/Ceremony/same.jpg']
+            broken = photos['Wedding/bad.jpg']
+            self.assertTrue(selected['editable'])
+            self.assertEqual(broken['report']['status'], 'error')
+            self.assertFalse(list(self.app.extensions['photo_temp'].iterdir()))
+            self.assertEqual(first.read_bytes(), photo_data)
+            response = self.client.post('/api/clean', headers=self.headers,
+                                        json={'ids': [selected['id'], broken['id'], 'missing']})
+            results = response.get_json()['results']
+            self.assertEqual([result['status'] for result in results], ['cleaned', 'error', 'error'])
+            expected = photo_data[:2] + photo_data[14450:]
+            self.assertEqual(first.read_bytes(), expected)
+            self.assertEqual(second.read_bytes(), photo_data)
+            self.assertEqual(first.stat().st_mode & 0o777, 0o640)
+            self.assertEqual(first.stat().st_mtime, 1_700_000_000)
+            if sys.platform == 'darwin':
+                self.assertEqual(subprocess.check_output(
+                    ['/usr/bin/xattr', '-p', 'com.example.photo-test', str(first)]).strip(), b'wedding')
+            self.assertEqual(list(first.parent.iterdir()), [first])
+            with self.client.get('/api/photos/' + selected['id'] + '/preview') as preview:
+                self.assertEqual(preview.data, expected)
+            retry = self.client.post('/api/clean', headers=self.headers, json={'ids': [selected['id']]})
+            self.assertEqual(retry.get_json()['results'][0]['status'], 'cleaned')
+            with self.client.get('/api/report') as report:
+                entry = next(p for p in json.loads(report.data)['photos'] if p['id'] == selected['id'])
+                self.assertEqual(entry['cleanup']['report']['status'], 'none')
+                self.assertNotIn('path', entry)
+                self.assertNotIn('state', entry)
+                self.assertNotIn(str(root), report.data.decode())
+
+    @requires_samples
+    def test_changed_or_failed_original_is_left_intact(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / 'photo.jpg'
+            shutil.copyfile(ROOT / SAMPLES[2], path)
+            with patch('app.choose_originals', return_value=[path]):
+                response = self.client.post('/api/choose', headers=self.headers, json={'kind': 'files'})
+            photo_id = response.get_json()['photos'][0]['id']
+            photo_data = path.read_bytes()
+            with patch('inspector.os.replace', side_effect=PermissionError('Cannot replace photo')):
+                failed = self.client.post('/api/clean', headers=self.headers, json={'ids': [photo_id]})
+            self.assertEqual(failed.get_json()['results'][0]['status'], 'error')
+            self.assertEqual(path.read_bytes(), photo_data)
+            self.assertEqual(list(path.parent.iterdir()), [path])
+            path.write_bytes(photo_data + b'changed')
+            changed = self.client.post('/api/clean', headers=self.headers, json={'ids': [photo_id]})
+            self.assertIn('changed after inspection', changed.get_json()['results'][0]['error'])
+            self.assertEqual(path.read_bytes(), photo_data + b'changed')
+            self.assertEqual(list(path.parent.iterdir()), [path])
+
+    def test_cancelled_picker_changes_nothing(self):
+        with patch('app.choose_originals', return_value=[]):
+            response = self.client.post('/api/choose', headers=self.headers, json={'kind': 'folders'})
+        self.assertEqual(response.get_json(), dict(photos=[], errors=[], cancelled=True))
 
     def test_local_request_guards_and_invalid_inputs(self):
         self.assertEqual(self.client.post('/api/samples').status_code, 403)
@@ -225,19 +321,21 @@ class ApiTests(unittest.TestCase):
         self.assertEqual(self.client.get('/api/photos/missing').status_code, 404)
         self.assertEqual(self.client.post('/api/clean', headers=self.headers, json={'ids': []}).status_code, 400)
         self.assertEqual(self.client.post('/api/clean', headers=self.headers, json={'ids': [42]}).status_code, 400)
-        for route in ['/api/clean', '/api/download.zip']:
+        for route in ['/api/clean', '/api/choose']:
             self.assertEqual(self.client.post(route, headers=self.headers, json=['invalid']).status_code, 400)
+        self.assertEqual(self.client.post('/api/choose', json={'kind': 'files'}).status_code, 403)
         response = self.client.get('/')
         self.assertIn(b'Photo Metadata Inspector', response.data)
         self.assertIn("connect-src 'self'", response.headers['Content-Security-Policy'])
 
     @requires_samples
-    def test_noop_and_unready_download(self):
-        photo = self.upload('plain.jpg', (ROOT / SAMPLES[0]).read_bytes()).get_json()
+    def test_uploaded_photo_is_inspection_only(self):
+        photo = self.upload('photo.jpg', (ROOT / SAMPLES[2]).read_bytes()).get_json()
+        self.assertFalse(photo['editable'])
         response = self.client.post('/api/clean', headers=self.headers, json={'ids': [photo['id']]})
-        self.assertEqual(response.get_json()['results'][0]['status'], 'skipped')
-        self.assertEqual(self.client.get('/api/photos/' + photo['id'] + '/download').status_code, 404)
-        self.assertEqual(self.client.post('/api/download.zip', headers=self.headers, json={'ids': [photo['id']]}).status_code, 409)
+        result = response.get_json()['results'][0]
+        self.assertEqual(result['status'], 'error')
+        self.assertIn('Choose the original', result['error'])
 
     @requires_samples
     def test_session_cleanup(self):
